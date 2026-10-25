@@ -5,6 +5,8 @@
 
 纯标准库 + ctypes + tkinter，零第三方依赖?
 用法?    python my_devices.py              # 托盘 + 简洁面板?    python my_devices.py --once       # 读一次并打印
+    python my_devices.py --once --k99-only  # K99 V3 passive candidate
+    python my_devices.py --once --k99-only --k99-query  # explicit official config read
     python my_devices.py --list       # 列出的 HID 接口
     python my_devices.py --panel      # 打开面板（不常驻托盘?    python my_devices.py --install    # 创建开机自启?+ 桌面入口
 """
@@ -24,6 +26,13 @@ import random
 import threading
 import time
 from typing import Optional
+
+from rapoo_protocol import VT3S_MAX_IDS as RAPOO_IDS, decode_input_report
+from rapoo_monitor import RapooInputMonitor
+from battery_alerts import LowBatteryAlerts
+from tray_state import tray_identity, tray_readings, reading_summary
+from mchose_k99_protocol import (K99_V3_IDS, K99_V3_WIRED_IDS, is_k99_v3,
+                                 decode_input_report as decode_k99_input_report)
 
 UI_SCALE = 1.0
 
@@ -49,8 +58,11 @@ FILE_SHARE_RW = 0x00000001 | 0x00000002
 OPEN_EXISTING = 3
 FILE_FLAG_OVERLAPPED = 0x40000000
 ERROR_IO_PENDING = 997
+ERROR_OPERATION_ABORTED = 995
+ERROR_NOT_FOUND = 1168
 WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x102
+WAIT_FAILED = 0xFFFFFFFF
 
 kernel32.CreateFileW.restype = wt.HANDLE
 kernel32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p,
@@ -63,6 +75,7 @@ kernel32.ReadFile.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD,
 kernel32.CreateEventW.restype = wt.HANDLE
 kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.BOOL, wt.LPCWSTR]
 kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+kernel32.WaitForSingleObject.restype = wt.DWORD
 kernel32.GetOverlappedResult.argtypes = [wt.HANDLE, ctypes.c_void_p,
                                          ctypes.POINTER(wt.DWORD), wt.BOOL]
 kernel32.CancelIoEx.argtypes = [wt.HANDLE, ctypes.c_void_p]
@@ -246,7 +259,7 @@ def _open_path(path: str, access: int, overlapped: bool = False) -> int:
                                 OPEN_EXISTING, flags, None)
 
 
-def enumerate_hid() -> list[HidIface]:
+def enumerate_hid(allowed_ids: Optional[set] = None) -> list[HidIface]:
     hdev = setupapi.SetupDiGetClassDevsW(
         ctypes.byref(GUID_DEVINTERFACE_HID), None, None,
         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
@@ -276,6 +289,12 @@ def enumerate_hid() -> list[HidIface]:
                 continue
             # DevicePath ?cbSize(DWORD) 之后：偏?4
             path = ctypes.wstring_at(ctypes.addressof(buf) + 4)
+            # Filter before opening any HID interface in a targeted verification.
+            if allowed_ids is not None:
+                path_lower = path.lower()
+                if not any(f"vid_{vid:04x}&pid_{pid:04x}" in path_lower
+                           for vid, pid in allowed_ids):
+                    continue
             inst = ctypes.create_unicode_buffer(512)
             inst_len = wt.DWORD(0)
             setupapi.SetupDiGetDeviceInstanceIdW(
@@ -340,8 +359,10 @@ class HidDevice:
             if not self.h or self.h == INVALID_HANDLE_VALUE:
                 raise HidError(f"打开接口失败（错误码 {err}）")
             self.write_mode = False
+        self.read_open_error = 0
         self.rh = _open_path(path, GENERIC_READ, overlapped=True)
         if not self.rh or self.rh == INVALID_HANDLE_VALUE:
+            self.read_open_error = ctypes.get_last_error()
             self.rh = 0
 
     def close(self):
@@ -362,10 +383,14 @@ class HidDevice:
 
     def read_input(self, length: int, timeout_ms: int = 800) -> Optional[bytes]:
         if not self.rh:
-            return None
+            err = getattr(self, "read_open_error", 0)
+            raise HidError(f"overlapped read handle unavailable (error {err})")
+
         ev = kernel32.CreateEventW(None, True, False, None)
         if not ev:
-            return None
+            err = ctypes.get_last_error()
+            raise HidError(f"CreateEventW failed (error {err})")
+
         try:
             ov = OVERLAPPED()
             ov.hEvent = ev
@@ -373,14 +398,51 @@ class HidDevice:
             got = wt.DWORD(0)
             ok = kernel32.ReadFile(self.rh, buf, length,
                                    ctypes.byref(got), ctypes.byref(ov))
-            if not ok and ctypes.get_last_error() != ERROR_IO_PENDING:
+            if ok:
+                return bytes(buf.raw[:got.value])
+
+            read_error = ctypes.get_last_error()
+            if read_error != ERROR_IO_PENDING:
+                raise HidError(f"ReadFile failed (error {read_error})")
+
+            wait_result = kernel32.WaitForSingleObject(ev, timeout_ms)
+            if wait_result == WAIT_OBJECT_0:
+                if not kernel32.GetOverlappedResult(
+                        self.rh, ctypes.byref(ov), ctypes.byref(got), True):
+                    err = ctypes.get_last_error()
+                    raise HidError(f"GetOverlappedResult failed (error {err})")
+                return bytes(buf.raw[:got.value])
+
+            # CancelIoEx only requests cancellation. Reap the operation before
+            # ov, buf, or ev can leave scope, even if cancellation races completion.
+            wait_error = (ctypes.get_last_error() if wait_result == WAIT_FAILED
+                          else wait_result)
+            cancel_ok = kernel32.CancelIoEx(self.rh, ctypes.byref(ov))
+            cancel_error = 0 if cancel_ok else ctypes.get_last_error()
+            completed = kernel32.GetOverlappedResult(
+                self.rh, ctypes.byref(ov), ctypes.byref(got), True)
+            completion_error = 0 if completed else ctypes.get_last_error()
+
+            if wait_result == WAIT_FAILED:
+                raise HidError(
+                    f"WaitForSingleObject failed (error {wait_error}); "
+                    f"overlapped completion error {completion_error}")
+            if wait_result != WAIT_TIMEOUT:
+                raise HidError(
+                    f"WaitForSingleObject returned unexpected result {wait_result}; "
+                    f"overlapped completion error {completion_error}")
+            if completed:
+                # The operation won the cancellation race; preserve its real data.
+                return bytes(buf.raw[:got.value])
+            if completion_error == ERROR_OPERATION_ABORTED:
                 return None
-            if kernel32.WaitForSingleObject(ev, timeout_ms) == WAIT_TIMEOUT:
-                kernel32.CancelIoEx(self.rh, ctypes.byref(ov))
-                return None
-            kernel32.GetOverlappedResult(self.rh, ctypes.byref(ov),
-                                         ctypes.byref(got), False)
-            return bytes(buf.raw[:got.value])
+            if not cancel_ok and cancel_error != ERROR_NOT_FOUND:
+                raise HidError(
+                    f"CancelIoEx failed (error {cancel_error}); "
+                    f"overlapped completion error {completion_error}")
+            raise HidError(
+                f"GetOverlappedResult after timeout failed "
+                f"(error {completion_error})")
         finally:
             kernel32.CloseHandle(ev)
 
@@ -569,7 +631,9 @@ class Reading:
 
     @property
     def text(self) -> str:
-        return f"{self.level}%" if self.ok and self.level is not None else "未连接"
+        if self.ok and self.level is not None:
+            return f"{self.level}%"
+        return "电量未知" if self.present else "未连接"
 
 
 STATUS_TEXT = {"charging": "充电中", "discharging": "放电中",
@@ -922,9 +986,6 @@ DEVICES = [
 
 
 def read_mouse(ifaces: list[HidIface]) -> Reading:
-    # 测试：临时忘记鼠标（VID/PID 与协讼
-    return Reading(ok=False, name="", source="", present=False,
-                   detail="已临时忘记该设备")
     spec = DEVICES[0]
     cands = [d for d in ifaces if (d.vid, d.pid) in spec.ids]
     if not cands:
@@ -958,9 +1019,6 @@ def read_mouse(ifaces: list[HidIface]) -> Reading:
 
 
 def read_headset(ifaces: list[HidIface]) -> Reading:
-    # 测试：临时忘记机（VID/PID 与协讼
-    return Reading(ok=False, name="", source="", present=False,
-                   detail="已临时忘记该设备")
     spec = DEVICES[1]
     cands = [d for d in ifaces if (d.vid, d.pid) in spec.ids]
     if not cands:
@@ -991,7 +1049,196 @@ def read_headset(ifaces: list[HidIface]) -> Reading:
                    detail="耳机没有上报电量（确认耳机已开机并与 dongle 连上）")
 
 
-def read_all(ifaces: Optional[list[HidIface]] = None) -> dict[str, Reading]:
+def read_rapoo(ifaces: list[HidIface], seconds: float = 3.0) -> Reading:
+    """Read only the documented VT input status report; send no commands."""
+    matching = [d for d in ifaces if (d.vid, d.pid) in RAPOO_IDS]
+    cands = [d for d in matching if d.usage_page == 0xFF00
+             and d.usage in (0x0E, 0x02) and d.input_len >= 13]
+    result = Reading(ok=False, name="Rapoo VT3S MAX", present=bool(matching),
+                     source="Rapoo input report 0x07",
+                     detail="未收到有效电量报告；原因尚未确定")
+    if not matching:
+        result.detail = "未找到 VT3S MAX 的已确认接口"
+        return result
+    meta = cands[0] if cands else matching[0]
+    result.vid, result.pid, result.usage_page = meta.vid, meta.pid, meta.usage_page
+    result.hid_known = True
+    if not cands:
+        result.detail = "已识别设备，但没有匹配的厂商输入报告接口"
+        return result
+    deadline = time.monotonic() + seconds
+    attempted, reports = 0, 0
+    report_ids: set[int] = set()
+    errors: list[str] = []
+    for iface in cands:
+        dev = None
+        try:
+            attempted += 1
+            dev = HidDevice(iface.path, write=False)
+            # Share one time budget across interfaces; no generic probing/fallback.
+            end = min(deadline, time.monotonic() + seconds / len(cands))
+            while time.monotonic() < end:
+                remaining_ms = int((end - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+                raw = dev.read_input(iface.input_len, min(250, remaining_ms))
+                if not raw:
+                    continue
+                reports += 1
+                report_ids.add(raw[0])
+                battery = decode_input_report(raw)
+                if battery is None:
+                    continue
+                result.ok, result.level = True, battery.level
+                result.status = battery.status
+                result.raw = raw
+                result.vid, result.pid = iface.vid, iface.pid
+                result.detail = f"本轮输入报告；连接模式={battery.connection_mode}"
+                return result
+        except HidError as exc:
+            errors.append(str(exc))
+        finally:
+            if dev is not None:
+                dev.close()
+    ids = ",".join(f"0x{rid:02X}" for rid in sorted(report_ids)) or "无"
+    result.detail = (f"未读到有效电量；尝试接口 {attempted}/{len(cands)}，"
+                     f"输入报告 {reports} 份，报告 ID={ids}；原因尚未确定")
+    if errors:
+        result.detail += "；读取错误：" + "；".join(errors)
+    return result
+
+
+def read_k99_v3(ifaces: list[HidIface], seconds: float = 3.0) -> Reading:
+    """Listen only on the official normal-mode GLW collection; never send."""
+    matching = [d for d in ifaces if is_k99_v3(d.vid, d.pid, d.product)]
+    # Page 1/usage 0 is the normal-mode filter. FF00/1 is boot mode only.
+    cands = [d for d in matching if (d.usage_page, d.usage) == (1, 0)
+             and d.input_len >= 6]
+    result = Reading(ok=False, name="MCHOSE K99 V3", present=bool(matching),
+                     source="MCHOSE GLW FA FB 07",
+                     detail="未找到 K99 V3 的已确认身份")
+    if not matching:
+        return result
+    meta = cands[0] if cands else matching[0]
+    result.vid, result.pid, result.usage_page = meta.vid, meta.pid, meta.usage_page
+    result.hid_known = True
+    if not cands:
+        result.detail = "已识别 K99 V3，但没有匹配的正常模式电量通知接口"
+        return result
+    deadline = time.monotonic() + max(0.0, seconds)
+    attempted, reports = 0, 0
+    charging_seen = False
+    errors: list[str] = []
+    for iface in cands:
+        if time.monotonic() >= deadline:
+            break
+        dev = None
+        try:
+            attempted += 1
+            dev = HidDevice(iface.path, write=False)
+            end = min(deadline, time.monotonic() + seconds / len(cands))
+            while time.monotonic() < end:
+                remaining_ms = int((end - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+                raw = dev.read_input(iface.input_len, min(250, remaining_ms))
+                if not raw:
+                    continue
+                reports += 1
+                battery = decode_k99_input_report(raw)
+                if battery is None:
+                    continue
+                if battery.level is None:
+                    charging_seen = True
+                    continue
+                result.ok, result.level = True, battery.level
+                result.status = battery.status
+                result.vid, result.pid = iface.vid, iface.pid
+                result.detail = "本轮 GLW 电量通知；实机兼容性待验收"
+                return result
+        except HidError as exc:
+            errors.append(str(exc))
+        finally:
+            if dev is not None:
+                dev.close()
+    result.detail = (f"未读到有效百分比；尝试接口 {attempted}/{len(cands)}，"
+                     f"输入报告 {reports} 份；原因尚未确定")
+    if charging_seen:
+        result.status = "charging"
+        result.detail += "；收到充电通知，该通知没有已证实的百分比"
+    if errors:
+        result.detail += "；读取错误：" + "；".join(errors)
+    return result
+
+
+def read_k99_config(ifaces: list[HidIface]) -> Reading:
+    """Read official command 05 configuration once per GUI/CLI refresh."""
+    from mchose_k99_protocol import (
+        GLW_CONFIG_REQUESTS, build_config_request, parse_config_response,
+        decode_config_battery,
+    )
+    matching = [d for d in ifaces if is_k99_v3(d.vid, d.pid, d.product)]
+    result = Reading(name="MCHOSE K99 V3", present=bool(matching),
+                     source="MCHOSE GLW command 05", detail="未找到 K99 V3 的已确认身份")
+    if not matching:
+        return result
+    meta = matching[0]
+    result.vid, result.pid, result.usage_page = meta.vid, meta.pid, meta.usage_page
+    result.hid_known = True
+    # No alternate collections, report-size guesses, retries or SDK initialization.
+    cands = [d for d in matching if (d.usage_page, d.usage) == (1, 0)
+             and d.input_len == 65 and d.output_len == 65]
+    if len(cands) != 1:
+        result.detail = (f"未发送查询：需要唯一的 0001:0000、输入/输出各65字节接口，匹配 {len(cands)} 个；"
+                         + "，".join(f"{d.usage_page:04X}:{d.usage:04X} in={d.input_len} out={d.output_len}"
+                                    for d in matching))
+        return result
+    dev = None
+    sent = reports = 0
+    try:
+        dev = HidDevice(cands[0].path, write=True)
+        if not dev.write_mode or not dev.rh:
+            result.detail = "未发送查询：目标读写句柄不可用"
+            return result
+        chunks = []
+        for request in GLW_CONFIG_REQUESTS:
+            raw_request = build_config_request(request)
+            if dev.write_output(raw_request) != len(raw_request):
+                raise HidError("查询报告写入不完整")
+            sent += 1
+            deadline = time.monotonic() + 1.0
+            chunk = None
+            while time.monotonic() < deadline:
+                remaining = int((deadline - time.monotonic()) * 1000)
+                if remaining <= 0:
+                    break
+                raw = dev.read_input(65, min(100, remaining))
+                if not raw:
+                    continue
+                reports += 1
+                chunk = parse_config_response(raw, request)
+                if chunk is not None:
+                    break
+            if chunk is None:
+                result.detail = f"配置读取超时；发送 {sent}/2，输入报告 {reports} 份，无匹配响应；未重试"
+                return result
+            chunks.append(chunk)
+        battery = decode_config_battery(b"".join(chunks))
+        if battery is None:
+            result.detail = "配置响应的电量字段无效，未作为百分比显示"
+            return result
+        result.ok, result.level, result.status = True, battery.level, battery.status
+        result.detail = "本轮官方配置读取；发送2条只读请求，收到两段匹配响应"
+        return result
+    except HidError as exc:
+        result.detail = f"配置读取失败；已发送 {sent}/2：{exc}"
+        return result
+    finally:
+        if dev is not None:
+            dev.close()
+
+
+def read_all(ifaces: Optional[list[HidIface]] = None, *, skip_rapoo: bool = False) -> dict[str, Reading]:
     ifaces = ifaces if ifaces is not None else enumerate_hid()
     mouse = read_mouse(ifaces)
     headset = read_headset(ifaces)
@@ -1011,6 +1258,17 @@ def read_all(ifaces: Optional[list[HidIface]] = None) -> dict[str, Reading]:
                                           meta.usage_page)
             r.hid_known = True
     out = {"mouse": mouse, "headset": headset}
+    if any((d.vid, d.pid) in RAPOO_IDS for d in ifaces):
+        if skip_rapoo:
+            meta = next(d for d in ifaces if (d.vid, d.pid) in RAPOO_IDS)
+            out["rapoo"] = Reading(
+                name="Rapoo VT3S MAX", present=True, vid=meta.vid, pid=meta.pid,
+                usage_page=meta.usage_page, hid_known=True,
+                source="Rapoo input report 0x07", detail="持续监听中，等待设备上报电量")
+        else:
+            out["rapoo"] = read_rapoo(ifaces)
+    if any(is_k99_v3(d.vid, d.pid, d.product) for d in ifaces):
+        out["keyboard"] = read_k99_config(ifaces)
     try:
         out.update(discover_extras(ifaces))
     except Exception:
@@ -1019,8 +1277,8 @@ def read_all(ifaces: Optional[list[HidIface]] = None) -> dict[str, Reading]:
 
 
 def known_ids() -> set:
-    """当前仍识别?VID/PID；测试状态：全部忘?"""
-    return set()
+    """IDs handled by dedicated readers must not enter generic discovery."""
+    return {pair for spec in DEVICES for pair in spec.ids} | RAPOO_IDS | K99_V3_WIRED_IDS
 
 
 def _unknown_reading(name: str, ifaces: list[HidIface],
@@ -1081,7 +1339,7 @@ def discover_extras(ifaces: list[HidIface]) -> dict[str, Reading]:
     groups: dict[str, dict] = {}
     known = known_ids()
     for d in ifaces:
-        if (d.vid, d.pid) in known:
+        if (d.vid, d.pid) in known or is_k99_v3(d.vid, d.pid, d.product):
             continue
         if d.usage_page < 0xFF00:
             continue
@@ -1460,7 +1718,7 @@ def create_shortcut(lnk_path: str, target: str, args: str = "",
 def install_startup() -> bool:
     path = startup_lnk()
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    create_shortcut(path, pythonw_path(), f'"{script_path()}"',
+    create_shortcut(path, pythonw_path(), f'"{script_path()}" --silent-start',
                     project_dir(), "外设电量托盘", pythonw_path())
     return os.path.isfile(path)
 
@@ -1866,15 +2124,24 @@ def set_custom_name(key: str, name: str) -> None:
 # ===========================================================================
 # CLI
 # ===========================================================================
-def print_once():
-    res = apply_last_known(read_all())
-    for key in ("mouse", "headset"):
-        r = res[key]
-        if r.ok:
-            suffix = f"；{r.detail}" if r.stale else f"（{r.source}）"
-            print(f"{r.name}：{r.level}%{suffix}")
+def print_once(rapoo_only: bool = False, k99_only: bool = False, k99_query: bool = False):
+    # A verification run must report this poll, never cached battery levels.
+    if rapoo_only:
+        res = {"rapoo": read_rapoo(enumerate_hid(RAPOO_IDS))}
+    elif k99_only:
+        reader = read_k99_config if k99_query else read_k99_v3
+        res = {"keyboard": reader(enumerate_hid(K99_V3_IDS))}
+    else:
+        res = read_all()
+    for r in res.values():
+        if not r.present:
+            continue
+        if r.ok and r.level is not None and not r.stale:
+            print(f"{r.name}：{r.level}%（{r.source}）")
         else:
-            print(f"{r.name}：{r.text}（{r.detail}）")
+            print(f"{r.name}：未读到实时电量（{r.detail}）")
+    if not any(r.present for r in res.values()):
+        print("没有找到支持的外设")
 
 
 def list_devices():
@@ -1896,16 +2163,33 @@ def main(argv):
     if "--help" in argv or "-h" in argv:
         print(__doc__)
         return 0
-    if "--once" in argv:
-        print_once()
+    if "--k99-query" in argv:
+        if "--once" not in argv or "--k99-only" not in argv or any(
+                flag in argv for flag in ("--rapoo-only", "--list", "--install", "--panel")):
+            print("--k99-query 只能与 --once --k99-only 一起使用")
+            return 2
+        print_once(k99_only=True, k99_query=True)
         return 0
+    if "--k99-only" in argv and "--rapoo-only" in argv:
+        print("--k99-only 不能与 --rapoo-only 同时使用")
+        return 2
+    if "--k99-only" in argv and "--once" not in argv:
+        print("--k99-only 必须与 --once 一起使用")
+        return 2
+    if "--once" in argv:
+        print_once(rapoo_only="--rapoo-only" in argv, k99_only="--k99-only" in argv)
+        return 0
+    if "--rapoo-only" in argv:
+        print("--rapoo-only 必须与 --once 一起使用")
+        return 2
     if "--list" in argv:
         list_devices()
         return 0
     if "--install" in argv:
         install_all()
         return 0
-    return run_gui(panel_only="--panel" in argv)
+    return run_gui(panel_only="--panel" in argv,
+                   silent_start="--silent-start" in argv)
 
 
 # ===========================================================================
@@ -2667,6 +2951,7 @@ class Panel:
         self.W = int(self.LW * self.S)
         self.H = int(self.LH * self.S)
         self.root = tk.Tk()
+        self.root.withdraw()
         self.root.title("外设电量")
         self.root.overrideredirect(True)
         self.root.configure(bg="#0B1322")
@@ -2722,7 +3007,6 @@ class Panel:
         except Exception:
             self._shadow = None
         self._center()
-        self.root.withdraw()
 
     def _center(self):
         sw = self.root.winfo_screenwidth()
@@ -2790,6 +3074,9 @@ class Panel:
                 pass
 
     def _close_help(self):
+        alert = getattr(self, "_alert_win", None)
+        if alert is not None:
+            alert.close()
         hw = getattr(self, "_help_win", None)
         if hw:
             try:
@@ -2910,7 +3197,7 @@ class Panel:
         iv = self.app.interval
         iv_text = (f"每 {iv // 60} 分钟自动刷新" if iv % 60 == 0
                    else f"每 {iv} 秒自动刷新")
-        cv.create_text(30, 58, text="2.4G 无线外设 · " + iv_text, anchor="w",
+        cv.create_text(30, 58, text="雷柏持续监听 · 其他设备" + iv_text, anchor="w",
                        fill=_rgb((150, 167, 189)), font=self._f(9))
         self._button(W - 44, 22, 28, 28, "×", self.hide)
 
@@ -2927,6 +3214,8 @@ class Panel:
         cv.scale("all", 0, 0, self.S, self.S)
 
     def _updated_text(self) -> str:
+        if self.app._refreshing:
+            return "正在刷新…"
         rs = self.app.snapshot()
         times = [r.ts for r in rs.values() if r.ts]
         if not times:
@@ -3001,7 +3290,7 @@ class Panel:
             cv.create_text(x2 - 24, y1 + 44, text="%", anchor="e",
                            fill=_rgb(self.LW_CHAMP_L), font=self._f(12, True))
         else:
-            cv.create_text(x2 - 26, y1 + 44, text="未连接", anchor="e",
+            cv.create_text(x2 - 26, y1 + 44, text=r.text, anchor="e",
                            fill=_rgb((109, 127, 150)), font=self._f(16, True))
 
         # 进度条：玻璃轨道 + 电量色填充
@@ -3116,7 +3405,7 @@ class Panel:
         iv = self.app.interval
         iv_text = (f"每 {iv // 60} 分钟自动刷新" if iv % 60 == 0
                    else f"每 {iv} 秒自动刷新")
-        cv.create_text(30, 56, text="2.4G 无线外设 · " + iv_text, anchor="w",
+        cv.create_text(30, 56, text="雷柏持续监听 · 其他设备" + iv_text, anchor="w",
                        fill=_rgb(self.DSH_SUB), font=self._f(9))
         self._button(W - 44, 20, 28, 28, "✕", self.hide, kind="close")
         self._scrollbar()
@@ -3131,7 +3420,19 @@ class Panel:
         self._check(380, 378, self._startup_var, "开机自启",
                     lambda: self._toggle_startup())
         self._button(484, 366, 52, 24, "退出", self.app.quit, kind="ghost")
+        threshold = self.app.low_battery_threshold
+        alert_text = f"低电量提醒：低于 {threshold}%" if threshold else "低电量提醒：已关闭"
+        self._button(24, 400, 172, 24, alert_text, self._edit_low_battery,
+                     kind="ghost")
         cv.scale("all", 0, 0, self.S, self.S)
+
+    def _edit_low_battery(self):
+        existing = getattr(self, "_alert_win", None)
+        if existing is not None:
+            existing.root.lift()
+            existing.entry.focus_set()
+            return
+        self._alert_win = LowBatteryWindow(self)
 
     def _draw_border(self):
         """整圈 2px 边框：一条闭合折线 + 圆角连接，避免直线/圆弧接头。"""
@@ -3219,10 +3520,7 @@ class Panel:
                     lambda e, k=key, x=(x1 + 18) * self.S, y=(y1 + 22) * self.S:
                     self._edit_name(k, x, y))
         unknown = (r.status == "unknown_proto")
-        meta = f"{r.vid:04X}:{r.pid:04X}" if r.vid else "----:----"
-        hid = (f"0x{r.usage_page:04X}"
-               if (r.hid_known and r.usage_page) else "未知")
-        line = f"{meta} · HID ({hid})"
+        line, state_detail = reading_summary(r)
         if unknown:
             text = f"{line}  协议未知，无法读取电量"
             cv.create_text(x1 + 18, y1 + 46, text=text, anchor="w",
@@ -3245,14 +3543,18 @@ class Panel:
         else:
             cv.create_text(x1 + 18, y1 + 46, text=line, anchor="w",
                            fill=_rgb(self.DSH_SUB), font=self._f(9))
+            if state_detail:
+                cv.create_text(x1 + 18, y1 + 68, text=state_detail, anchor="w",
+                               fill=_rgb(self.DSH_MUTED), font=self._f(9))
         lv = r.level if r.ok else None
         if r.ok and lv is not None:
             cv.create_text(x2 - 44, y1 + 40, text=str(lv), anchor="e",
-                           fill=_rgb(self.DSH_TEXT), font=self._f(30, True))
+                           fill=_rgb(self.DSH_MUTED if r.stale else self.DSH_TEXT),
+                           font=self._f(30, True))
             cv.create_text(x2 - 24, y1 + 40, text="%", anchor="e",
                            fill=_rgb(self.DSH_SUB), font=self._f(11))
         elif not unknown:
-            cv.create_text(x2 - 24, y1 + 40, text="未连接", anchor="e",
+            cv.create_text(x2 - 24, y1 + 40, text=r.text, anchor="e",
                            fill=_rgb(self.DSH_MUTED), font=self._f(14, True))
         bx1, bx2 = x1 + 18, x2 - 18
         by = y2 - 24
@@ -3261,7 +3563,8 @@ class Panel:
         if lv is not None and lv > 0:
             w = int((bx2 - bx1) * lv / 100)
             draw_round_rect(cv, bx1, by, bx1 + max(6, w), by + 6, 3,
-                            fill=_rgb(self._level_rgb(lv)), outline="")
+                            fill=_rgb(self.DSH_MUTED if r.stale else self._level_rgb(lv)),
+                            outline="")
 
     def _empty_card(self, x1, y1, x2, y2):
         """没有任何 2.4G 接收器时的占位卡：只有提示和空电量槽?"""
@@ -3469,6 +3772,109 @@ class Panel:
         self.root.after(350, self.poll)
 
 
+class LowBatteryWindow(Panel):
+    """Small modal using the panel's palette, typography and canvas buttons."""
+
+    LW, LH = 360, 240
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.app = parent.app
+        self.S = parent.S
+        self.W, self.H = int(self.LW * self.S), int(self.LH * self.S)
+        self._btns = {}
+        self._drag = None
+        self._shadow = None
+        self.root = tk.Toplevel(parent.root)
+        self.root.withdraw()
+        self.root.title("低电量提醒")
+        self.root.overrideredirect(True)
+        self.root.transient(parent.root)
+        self.root.configure(bg=_rgb(self.DSH_BG))
+        self.root.attributes("-topmost", True)
+        self.cv = tk.Canvas(self.root, width=self.W, height=self.H,
+                            bg=_rgb(self.DSH_BG), highlightthickness=0, bd=0)
+        self.cv.pack()
+        self.cv.bind("<Button-1>", self._on_press)
+        self.cv.bind("<B1-Motion>", self._on_drag)
+        self.cv.bind("<ButtonRelease-1>", self._on_release)
+        self.root.bind("<Escape>", lambda e: self.close())
+        self.root.bind("<Return>", lambda e: self._save())
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        cv = self.cv
+        cv.create_text(24, 30, text="低电量提醒", anchor="w",
+                       fill=_rgb(self.DSH_TEXT), font=self._f(16, True))
+        cv.create_text(24, 56, text="电量低于设定值时发送 Windows 通知", anchor="w",
+                       fill=_rgb(self.DSH_SUB), font=self._f(9))
+        self._button(316, 16, 28, 28, "✕", self.close, kind="close")
+        draw_round_rect(cv, 24, 80, 336, 128, 10,
+                        fill=_rgb(self.DSH_CARD), outline=_rgb(self.DSH_BORDER))
+        self.entry = tk.Entry(self.root, bg=_rgb(self.DSH_CARD),
+                              fg=_rgb(self.DSH_TEXT), insertbackground=_rgb(self.DSH_TEXT),
+                              relief="flat", bd=0, highlightthickness=0,
+                              font=self._f(20, True), selectbackground="#43454A",
+                              selectforeground=_rgb(self.DSH_TEXT),
+                              validate="key", validatecommand=(
+                                  self.root.register(lambda value: value == "" or
+                                      (value.isascii() and value.isdigit() and len(value) <= 3)),
+                                  "%P"))
+        self.entry.insert(0, str(self.app.low_battery_threshold))
+        cv.create_window(40, 104, anchor="w", window=self.entry,
+                         width=int(240 * self.S), height=int(36 * self.S))
+        cv.create_text(312, 104, text="%", fill=_rgb(self.DSH_SUB), font=self._f(12))
+        cv.create_text(24, 148, text="范围 1–100%，设为 0 可关闭提醒", anchor="w",
+                       fill=_rgb(self.DSH_MUTED), font=self._f(9))
+        self._error = cv.create_text(24, 168, text="", anchor="w",
+                                     fill="#F87171", font=self._f(9))
+        self._button(24, 190, 112, 30, "测试通知", self._test_notification, kind="ghost")
+        self._button(168, 190, 76, 30, "取消", self.close, kind="ghost")
+        self._button(252, 190, 84, 30, "保存", self._save, kind="solid")
+        cv.scale("all", 0, 0, self.S, self.S)
+        self._draw_border()
+        self.root.update_idletasks()
+        set_round_region(self.root.winfo_id(), self.W, self.H, int(32 * self.S))
+        x = parent.root.winfo_x() + (parent.W - self.W) // 2
+        y = parent.root.winfo_y() + (parent.H - self.H) // 2
+        x = max(0, min(x, self.root.winfo_screenwidth() - self.W))
+        y = max(0, min(y, self.root.winfo_screenheight() - self.H))
+        self.root.geometry(f"{self.W}x{self.H}+{x}+{y}")
+        self.root.deiconify()
+        self.root.lift()
+        self.root.grab_set()
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+
+    def _save(self):
+        text = self.entry.get().strip()
+        if not text or not text.isascii() or not text.isdigit() or not 0 <= int(text) <= 100:
+            self.cv.itemconfigure(self._error, text="请输入 0–100 之间的整数")
+            self.entry.focus_set()
+            return
+        self.app.set_low_battery_threshold(int(text))
+        self.close()
+        self.parent.render()
+
+    def _test_notification(self):
+        self.app.request_test_notification()
+        self._test_deadline = time.monotonic() + 10
+        self._poll_test_notification()
+
+    def _poll_test_notification(self):
+        status = self.app.notification_test_status
+        if time.monotonic() >= self._test_deadline and self.app._test_notification_pending:
+            self.app._test_notification_pending = False
+            status = "已提交，未确认弹出；请检查 Windows 通知设置"
+            self.app.notification_test_status = status
+        self.cv.itemconfigure(self._error, text=status, fill=_rgb(self.DSH_SUB))
+        if self.app._test_notification_pending:
+            self.root.after(250, self._poll_test_notification)
+
+    def close(self):
+        self.parent._alert_win = None
+        self.root.grab_release()
+        self.root.destroy()
+
+
 # ===========================================================================
 # 托盘
 # ===========================================================================
@@ -3477,6 +3883,8 @@ WM_TRAYICON = WM_APP + 1
 WM_APP_REFRESH = WM_APP + 2
 WM_APP_SHOW = WM_APP + 3
 WM_APP_INTERVAL = WM_APP + 4
+WM_APP_TEST_NOTIFY = WM_APP + 5
+NIN_BALLOONSHOW = 0x0402
 WM_TIMER = 0x0113
 WM_DESTROY = 0x0002
 WM_CLOSE = 0x0010
@@ -3491,7 +3899,9 @@ NIF_MESSAGE = 1
 NIF_ICON = 2
 NIF_TIP = 4
 NIF_INFO = 0x10
+NIF_GUID = 0x20
 NIIF_INFO = 0x1
+NIIF_WARNING = 0x2
 NIIF_USER = 0x4
 NIIF_LARGE_ICON = 0x20
 
@@ -3581,6 +3991,8 @@ class Tray:
         if not self.hwnd:
             return
         self._add_icons()
+        self.app._check_full(self.app.snapshot())
+        self.app._check_low_battery(self.app.snapshot())
         user32.SetTimer(self.hwnd, 1, max(30, self.app.interval) * 1000, None)
 
         msg = wt.MSG()
@@ -3592,21 +4004,18 @@ class Tray:
         self.app._stop = True
 
     def _add_icons(self):
+        for icon in self.icons.values():
+            user32.DestroyIcon(icon)
         self.icons.clear()
         self.nids.clear()
         self.icon_keys.clear()
         self.sync_icons()
 
     def sync_icons(self):
-        """按实际插入的接收器减托盘图标；七没有时清空托盘?"""
+        """Keep device identity across refreshes, short failures and reconnects."""
         snap = self.app.snapshot()
-        known = [k for k in ("mouse", "headset")
-                 if snap.get(k) and snap[k].present]
-        extras = [k for k, r in snap.items()
-                  if k not in ("mouse", "headset") and r and r.present
-                  and r.ok and r.level is not None]
-        present = known + extras
-        desired = {i + 1: k for i, k in enumerate(present[:4])}
+        keys = tray_readings(snap)
+        desired = {tray_identity(key)[0]: key for key in keys}
         for uid in list(self.nids):
             if uid not in desired:
                 shell32.Shell_NotifyIconW(NIM_DELETE,
@@ -3620,16 +4029,19 @@ class Tray:
             if uid in self.nids:
                 nid = self.nids[uid]
                 self._fill_icon(nid, key)
-                shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+                if not shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid)):
+                    shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
             else:
                 nid = self._make_nid(uid)
+                nid.guidItem = GUID(tray_identity(key)[1])
+                nid.uFlags |= NIF_GUID
                 self._fill_icon(nid, key)
-                shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
-                self.nids[uid] = nid
+                if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+                    self.nids[uid] = nid
 
     def _fill_icon(self, nid: NOTIFYICONDATAW, key: str):
         r = self.app.snapshot().get(key)
-        lvl = r.level if (r and r.ok) else None
+        lvl = r.level if (r and r.ok and not r.stale) else None
         charging = bool(r and r.status == "charging")
         k = (lvl is None, None if lvl is None else (lvl // 10), charging,
              self.app.theme_light)
@@ -3643,35 +4055,36 @@ class Tray:
                 user32.DestroyIcon(old)
         else:
             nid.hIcon = old
-        name = (r.name if r and r.name else
-                (DEVICES[0].name if key == "mouse" else DEVICES[1].name))
+        name = (r.name if r and r.name else "外设电量")
         stamp = time.strftime("%H:%M", time.localtime(r.ts)) if r else "--:--"
-        tip = f"{name}：{r.level}%（{stamp}）" if (r and r.ok) else f"{name}：未连接（{stamp}）"
+        if r and r.ok and r.level is not None:
+            marker = " · 上次读数" if r.stale else ""
+            tip = f"{name}：{r.level}%（{stamp}）{marker}"
+        else:
+            state = "未读到电量" if r and r.present else "未连接"
+            tip = f"{name}：{state}（{stamp}）"
         nid.szTip = tip[:127]
 
     def refresh_icons(self):
         self.sync_icons()
 
-    def notify(self, text: str, title: str = "外设电量") -> bool:
+    def notify(self, text: str, title: str = "外设电量", *, warning=False) -> bool:
         """托盘气泡通知（Windows 通知丿也会收到），?64px 满绿玁图标?"""
-        nid = self.nids.get(1)
-        if nid is None:
+        source = next(iter(self.nids.values()), None)
+        if source is None:
             return False
-        if not self._big_icon:
+        # Do not change the live tray structure while another refresh uses it.
+        nid = NOTIFYICONDATAW.from_buffer_copy(bytes(source))
+        if not warning and not self._big_icon:
             self._big_icon = make_battery_icon(100, self.app.theme_light,
                                                False, size=64)
-        old_icon = nid.hIcon
-        if self._big_icon:
-            nid.hIcon = self._big_icon
-        nid.uFlags = NIF_INFO | NIF_ICON
-        nid.uVersion = 10000          # 10 ?        nid.szInfo = text[:255]
+        nid.uFlags = NIF_INFO | (source.uFlags & NIF_GUID)
+        nid.uVersion = 10000
+        nid.szInfo = text[:255]
         nid.szInfoTitle = title[:63]
-        nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON
-        nid.hBalloonIcon = self._big_icon
+        nid.dwInfoFlags = NIIF_WARNING if warning else NIIF_USER | NIIF_LARGE_ICON
+        nid.hBalloonIcon = 0 if warning else self._big_icon
         ok = shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
-        nid.hIcon = old_icon
-        nid.hBalloonIcon = 0
         return bool(ok)
 
     def destroy(self):
@@ -3688,10 +4101,13 @@ class Tray:
     def _proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_TRAYICON:
             cmd = lparam & 0xFFFF
-            if cmd == WM_RBUTTONUP:
+            if cmd == NIN_BALLOONSHOW and self.app._test_notification_pending:
+                self.app.notification_test_status = "Windows 已反馈：测试通知已显示"
+                self.app._test_notification_pending = False
+            elif cmd == WM_RBUTTONUP:
                 self.app.request_show()
             elif cmd == WM_LBUTTONUP:
-                self.app.refresh()
+                self.app.request_show()
             return 0
         if msg == WM_TIMER:
             self.app.refresh()
@@ -3710,6 +4126,17 @@ class Tray:
             return 0
         if msg == WM_APP_REFRESH:
             self.refresh_icons()
+            self.app._check_full(self.app.snapshot())
+            self.app._check_low_battery(self.app.snapshot())
+            return 0
+        if msg == WM_APP_TEST_NOTIFY:
+            self.sync_icons()
+            if self.notify("这是一条测试通知，用于确认外设低电量提醒能够弹出。",
+                           "外设电量 · 通知测试", warning=True):
+                self.app.notification_test_status = "测试已提交，等待 Windows 显示…"
+            else:
+                self.app.notification_test_status = "发送失败：请先确认已有有效设备电量"
+                self.app._test_notification_pending = False
             return 0
         if msg == WM_APP_SHOW:
             self.app.request_show()
@@ -3733,8 +4160,9 @@ class Tray:
 # 应用编排
 # ===========================================================================
 class TrayApp:
-    def __init__(self, panel_only: bool = False):
+    def __init__(self, panel_only: bool = False, silent_start: bool = False):
         self.panel_only = panel_only
+        self.silent_start = silent_start
         self.theme_light = is_light_theme()
         self.interval = clamp_interval(load_config().get("interval", 60))
         self._readings: dict[str, Reading] = {}
@@ -3746,6 +4174,12 @@ class TrayApp:
         self._dirty = False
         self._show_requested = False
         self._full: dict[str, bool] = {}
+        self._low_alerts = LowBatteryAlerts(load_config().get("low_battery_threshold", 20))
+        self.low_battery_threshold = self._low_alerts.threshold
+        self.notification_test_status = ""
+        self._test_notification_pending = False
+        self._rapoo_updates = queue.Queue()
+        self._rapoo_monitor = RapooInputMonitor(HidDevice, self._rapoo_updates)
 
     # -- 数据 --------------------------------------------------------------
     def snapshot(self) -> dict[str, Reading]:
@@ -3756,21 +4190,84 @@ class TrayApp:
         if self._refreshing:
             return
         self._refreshing = True
+        self._dirty = True
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
         try:
-            res = apply_last_known(read_all())
-        except Exception as e:
-            res = {k: Reading(ok=False, name=s.name, detail=f"读取异常：{e}")
-                   for k, s in (("mouse", DEVICES[0]), ("headset", DEVICES[1]))}
-        with self._lock:
-            self._readings = res
-        self._check_full(res)
-        self._refreshing = False
-        self._dirty = True
-        if self.tray and self.tray.hwnd:
-            user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
+            ifaces = None
+            try:
+                ifaces = enumerate_hid()
+                self._rapoo_monitor.configure(ifaces)
+                res = read_all(ifaces, skip_rapoo=True)
+                with self._lock:
+                    previous = self._readings.get("rapoo")
+                    if (res.get("rapoo") and res["rapoo"].present
+                            and previous and previous.ok and not previous.stale):
+                        res["rapoo"] = previous
+                res = apply_last_known(res)
+            except Exception as e:
+                res = {k: Reading(ok=False, present=False, name=s.name,
+                                  detail=f"读取异常：{e}")
+                       for k, s in (("mouse", DEVICES[0]), ("headset", DEVICES[1]))}
+                with self._lock:
+                    previous = self._readings.get("keyboard")
+                    if previous and (ifaces is None or any(
+                            is_k99_v3(d.vid, d.pid, d.product) for d in ifaces)):
+                        res["keyboard"] = dataclasses.replace(
+                            previous, stale=bool(previous.ok and previous.level is not None),
+                            detail=f"本轮读取失败：{e}")
+                    current = self._readings.get("rapoo")
+                    if current and (ifaces is None or any(
+                            (d.vid, d.pid) in RAPOO_IDS for d in ifaces)):
+                        res["rapoo"] = current
+            with self._lock:
+                current = self._readings.get("rapoo")
+                if (res.get("rapoo") and res["rapoo"].present and current and current.ok
+                        and not current.stale and (not res["rapoo"].ok
+                            or res["rapoo"].stale or current.ts >= res["rapoo"].ts)):
+                    res["rapoo"] = current
+                self._readings = res
+        finally:
+            self._refreshing = False
+            self._dirty = True
+            if self.tray and self.tray.hwnd:
+                user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
+
+    def _drain_rapoo_updates(self):
+        """Apply input events on the Tk thread, independently of periodic polls."""
+        latest = None
+        errors = []
+        while True:
+            try:
+                event = self._rapoo_updates.get_nowait()
+            except queue.Empty:
+                break
+            if event[0] == "reading":
+                _, iface, battery, raw, received_at = event
+                latest = Reading(
+                    ok=True, level=battery.level, status=battery.status,
+                    name="Rapoo VT3S MAX", source="Rapoo input report 0x07",
+                    detail="持续监听：设备最新上报", ts=received_at, raw=raw,
+                    vid=iface.vid, pid=iface.pid, usage_page=iface.usage_page,
+                    hid_known=True)
+            elif event[0] == "error":
+                errors.append(event[2])
+        if latest is not None:
+            with self._lock:
+                self._readings["rapoo"] = latest
+            self._dirty = True
+            if self.tray and self.tray.hwnd:
+                user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
+        elif errors:
+            with self._lock:
+                reading = self._readings.get("rapoo")
+                if reading:
+                    reading.stale = bool(reading.ok and reading.level is not None)
+                    reading.detail = "读取错误：" + "；".join(errors)
+                    self._dirty = True
+            if self.tray and self.tray.hwnd:
+                user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
 
     def _check_full(self, res):
         """电量首?100% 时弹?Windows 通知；掉?97% 以下重新布防?"""
@@ -3779,14 +4276,48 @@ class TrayApp:
                 continue
             if r.level >= 100:
                 if not self._full.get(key):
-                    self._full[key] = True
                     if self.tray:
                         try:
-                            self.tray.notify(f"{r.name} 已经充满电啦")
+                            if self.tray.notify(f"{r.name} 已经充满电啦"):
+                                self._full[key] = True
                         except Exception:
                             pass
             elif r.level < 97:
                 self._full[key] = False
+
+    def _check_low_battery(self, res):
+        # Called by the tray thread after icons exist, including at first reading.
+        with self._lock:
+            pending = self._low_alerts.pending(res)
+            if not pending or not self.tray:
+                return
+            text = "；".join(f"{r.name or key} 剩余 {r.level}%"
+                            for key, r in pending.items()) + "，请及时充电。"
+            if self.tray.notify(text, "外设低电量提醒", warning=True):
+                self._low_alerts.mark_sent(pending)
+
+    def set_low_battery_threshold(self, value):
+        with self._lock:
+            self.low_battery_threshold = self._low_alerts.set_threshold(value)
+        cfg = load_config()
+        cfg["low_battery_threshold"] = self.low_battery_threshold
+        save_config(cfg)
+        self._dirty = True
+        if self.tray and self.tray.hwnd:
+            user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
+        return self.low_battery_threshold
+
+    def request_test_notification(self):
+        if self._test_notification_pending:
+            return
+        if not self.tray or not self.tray.hwnd:
+            self.notification_test_status = "请使用默认托盘模式测试通知"
+            return
+        self.notification_test_status = "正在发送测试通知…"
+        self._test_notification_pending = True
+        if not user32.PostMessageW(self.tray.hwnd, WM_APP_TEST_NOTIFY, 0, 0):
+            self._test_notification_pending = False
+            self.notification_test_status = "测试请求发送失败，请重启工具后重试"
 
     # -- 交互 --------------------------------------------------------------
     def request_show(self):
@@ -3813,6 +4344,7 @@ class TrayApp:
 
     def quit(self):
         self._stop = True
+        self._rapoo_monitor.stop()
         if self.tray and self.tray.hwnd:
             user32.PostMessageW(self.tray.hwnd, WM_CLOSE, 0, 0)
         if self.panel:
@@ -3829,9 +4361,11 @@ class TrayApp:
         if not self.panel_only:
             self.tray = Tray(self)
             self.tray.start()
+        self._rapoo_monitor.start()
         self.refresh()
 
         def tick():
+            self._drain_rapoo_updates()
             if self._show_requested:
                 self._show_requested = False
                 self.panel.show()
@@ -3845,9 +4379,14 @@ class TrayApp:
             self.root.after(250, tick)
 
         self.root.after(250, tick)
-        if self.panel_only:
+        # Manual launches show the panel; Startup launches keep it hidden.
+        if self.panel_only or not self.silent_start:
             self.panel.show()
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        finally:
+            self._rapoo_monitor.stop()
+            self._rapoo_monitor.join()
 
 
 APP_ID = "2.4GDevice.BatteryPanel"
@@ -3871,7 +4410,7 @@ def register_app_identity():
         pass
 
 
-def run_gui(panel_only: bool = False) -> int:
+def run_gui(panel_only: bool = False, silent_start: bool = False) -> int:
     global UI_SCALE
     register_app_identity()
     user32.SetProcessDPIAware()
@@ -3884,10 +4423,10 @@ def run_gui(panel_only: bool = False) -> int:
     mutex = kernel32.CreateMutexW(None, False, "Local\\BatteryTrayDSH_Mutex")
     if ctypes.get_last_error() == 183 and mutex:  # ERROR_ALREADY_EXISTS
         hwnd = user32.FindWindowW(Tray.CLASS_NAME, None)
-        if hwnd:
+        if hwnd and not silent_start:
             user32.PostMessageW(hwnd, WM_APP_SHOW, 0, 0)
         return 0
-    app = TrayApp(panel_only=panel_only)
+    app = TrayApp(panel_only=panel_only, silent_start=silent_start)
     app.run()
     return 0
 

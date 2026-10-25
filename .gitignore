@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local development handoffs
+/HANDOFF_ANALYSIS.md
+/HANDOFF_DEVELOPMENT.md
